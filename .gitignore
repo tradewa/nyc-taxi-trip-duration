@@ -1,0 +1,52 @@
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.RDataTmp
+.Rapp.history
+.Rprofile.user
+.positai/
+
+# renv local state
+renv/library/
+renv/local/
+renv/cellar/
+renv/lock/
+renv/python/
+renv/sandbox/
+renv/staging/
+
+# Quarto render/cache outputs
+/.quarto/
+*_cache/
+*_files/
+*.knit.md
+*.utf8.md
+
+# Rendered report outputs
+*.html
+*.pdf
+*.docx
+
+# Local data and generated artifacts
+data/
+outputs/
+output/
+artifacts/
+*.parquet
+*.feather
+*.rds
+*.Rds
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+*.bak
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

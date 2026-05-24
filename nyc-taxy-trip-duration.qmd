@@ -1,0 +1,304 @@
+---
+title: "NYC Taxi Trip Duration: First Look"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+execute:
+  warning: false
+  message: false
+---
+
+## Goal
+
+This document starts with a first exploratory look at `data/train.csv`. The aim is to understand the shape, variables, date coverage, missingness, basic distributions, and obvious data quality issues before doing feature engineering or modeling.
+
+## Setup
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(scales)
+
+theme_set(theme_minimal(base_size = 12))
+```
+
+## Read the Training Data
+
+```{r}
+train_raw <- readr::read_csv("data/train.csv", show_col_types = FALSE)
+
+train <- train_raw %>%
+  mutate(
+    pickup_date = as_date(pickup_datetime),
+    pickup_month = floor_date(pickup_datetime, "month"),
+    pickup_wday = wday(pickup_datetime, label = TRUE, week_start = 1),
+    pickup_hour = hour(pickup_datetime),
+    duration_min = trip_duration / 60,
+    duration_hour = trip_duration / 3600,
+    store_and_fwd_flag = factor(store_and_fwd_flag),
+    vendor_id = factor(vendor_id)
+  )
+```
+
+The training file has `r comma(nrow(train_raw))` rows and `r ncol(train_raw)` original columns.
+
+```{r}
+glimpse(train_raw)
+```
+
+Initial observations:
+
+- `id` is the trip identifier.
+- `vendor_id` and `store_and_fwd_flag` are categorical fields.
+- `pickup_datetime` and `dropoff_datetime` are parsed as datetimes.
+- Pickup and dropoff locations are longitude/latitude pairs.
+- `trip_duration` is the target variable, measured in seconds.
+
+## Basic Data Checks
+
+```{r}
+train %>%
+  summarise(
+    rows = n(),
+    columns = ncol(train_raw),
+    distinct_ids = n_distinct(id),
+    duplicate_ids = rows - distinct_ids,
+    missing_cells = sum(is.na(across(everything()))),
+    min_pickup = min(pickup_datetime),
+    max_pickup = max(pickup_datetime),
+    min_dropoff = min(dropoff_datetime),
+    max_dropoff = max(dropoff_datetime)
+  )
+```
+
+There are no missing cells in the training file, and the trip IDs are unique. Pickups cover January through June 2016, with some dropoffs spilling into July 2016.
+
+```{r}
+train %>%
+  summarise(
+    across(
+      everything(),
+      ~ sum(is.na(.x))
+    )
+  ) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "column",
+    values_to = "missing_n"
+  ) %>%
+  arrange(desc(missing_n), column)
+```
+
+## Categorical Variables
+
+```{r}
+train %>%
+  count(vendor_id, sort = TRUE) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(x = vendor_id, y = n, fill = vendor_id)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = percent(pct, accuracy = 0.1)), vjust = -0.4) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "Trips by vendor",
+    x = "Vendor ID",
+    y = "Trips"
+  )
+```
+
+```{r}
+train %>%
+  count(store_and_fwd_flag, sort = TRUE) %>%
+  mutate(pct = n / sum(n))
+```
+
+Most trips are not store-and-forward trips. Vendor 2 has a somewhat larger share of the training rows than vendor 1.
+
+## Passenger Count
+
+```{r}
+train %>%
+  count(passenger_count) %>%
+  mutate(pct = n / sum(n)) %>%
+  arrange(passenger_count)
+```
+
+```{r}
+train %>%
+  count(passenger_count) %>%
+  ggplot(aes(x = passenger_count, y = n)) +
+  geom_col(fill = "#2f6f6d") +
+  scale_y_continuous(labels = comma) +
+  scale_x_continuous(breaks = 0:9) +
+  labs(
+    title = "Passenger count distribution",
+    x = "Passenger count",
+    y = "Trips"
+  )
+```
+
+Most trips have one passenger. There are a few unusual values, including 60 trips with zero passengers and rare trips with 7, 8, or 9 passengers. These should be treated as possible data quality issues later.
+
+## Trip Duration
+
+```{r}
+train %>%
+  summarise(
+    min_seconds = min(trip_duration),
+    p01_seconds = quantile(trip_duration, 0.01),
+    median_seconds = median(trip_duration),
+    mean_seconds = mean(trip_duration),
+    p99_seconds = quantile(trip_duration, 0.99),
+    max_seconds = max(trip_duration),
+    median_minutes = median(duration_min),
+    mean_minutes = mean(duration_min),
+    max_hours = max(duration_hour)
+  )
+```
+
+The target is strongly right-skewed. The median trip is about 11 minutes, while the maximum is extremely large. The long right tail will matter for both visualization and modeling.
+
+```{r}
+train %>%
+  ggplot(aes(x = trip_duration)) +
+  geom_histogram(bins = 80, fill = "#3f7cac", color = "white", linewidth = 0.1) +
+  scale_x_log10(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Trip duration is highly right-skewed",
+    subtitle = "The x-axis is log-scaled because a small number of trips are extremely long.",
+    x = "Trip duration in seconds, log scale",
+    y = "Trips"
+  )
+```
+
+```{r}
+train %>%
+  filter(trip_duration <= quantile(trip_duration, 0.99)) %>%
+  ggplot(aes(x = duration_min)) +
+  geom_histogram(binwidth = 2, fill = "#52796f", color = "white", linewidth = 0.1) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Trip duration below the 99th percentile",
+    x = "Trip duration in minutes",
+    y = "Trips"
+  )
+```
+
+## Time Coverage and Trip Volume
+
+```{r}
+train %>%
+  count(pickup_date) %>%
+  ggplot(aes(x = pickup_date, y = n)) +
+  geom_line(color = "#2f6f6d", linewidth = 0.5) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Daily pickup volume",
+    x = "Pickup date",
+    y = "Trips"
+  )
+```
+
+```{r}
+train %>%
+  count(pickup_hour) %>%
+  ggplot(aes(x = pickup_hour, y = n)) +
+  geom_col(fill = "#3f7cac") +
+  scale_x_continuous(breaks = 0:23) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Pickup volume by hour of day",
+    x = "Pickup hour",
+    y = "Trips"
+  )
+```
+
+```{r}
+train %>%
+  count(pickup_wday) %>%
+  ggplot(aes(x = pickup_wday, y = n)) +
+  geom_col(fill = "#b56576") +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Pickup volume by weekday",
+    x = "Pickup weekday",
+    y = "Trips"
+  )
+```
+
+Pickup volume is lowest in the early morning hours and highest in the evening. The training set also has slightly more trips toward the end of the week than at the beginning.
+
+## Location Variables
+
+```{r}
+train %>%
+  summarise(
+    across(
+      c(pickup_longitude, pickup_latitude, dropoff_longitude, dropoff_latitude),
+      list(
+        min = min,
+        p01 = ~ quantile(.x, 0.01),
+        median = median,
+        p99 = ~ quantile(.x, 0.99),
+        max = max
+      )
+    )
+  ) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = c("field", ".value"),
+    names_pattern = "(.*)_(min|p01|median|p99|max)"
+  )
+```
+
+Most coordinates are tightly centered around New York City, but the raw minima and maxima show outliers far outside the expected NYC range. These should be filtered or otherwise handled before distance-based modeling.
+
+```{r}
+set.seed(2026)
+
+train_geo_sample <- train %>%
+  filter(
+    between(pickup_longitude, -74.1, -73.7),
+    between(dropoff_longitude, -74.1, -73.7),
+    between(pickup_latitude, 40.55, 40.95),
+    between(dropoff_latitude, 40.55, 40.95)
+  ) %>%
+  slice_sample(n = 50000)
+```
+
+```{r}
+train_geo_sample %>%
+  ggplot(aes(x = pickup_longitude, y = pickup_latitude)) +
+  geom_point(alpha = 0.08, size = 0.4, color = "#2f6f6d") +
+  coord_quickmap() +
+  labs(
+    title = "Sampled pickup locations within the NYC bounding box",
+    x = "Pickup longitude",
+    y = "Pickup latitude"
+  )
+```
+
+```{r}
+train_geo_sample %>%
+  ggplot(aes(x = dropoff_longitude, y = dropoff_latitude)) +
+  geom_point(alpha = 0.08, size = 0.4, color = "#b56576") +
+  coord_quickmap() +
+  labs(
+    title = "Sampled dropoff locations within the NYC bounding box",
+    x = "Dropoff longitude",
+    y = "Dropoff latitude"
+  )
+```
+
+## First-Look Notes
+
+The training data are clean in the sense that all expected fields are present, IDs are unique, and no cells are missing. The main issues are not missingness but distributional shape and plausibility:
+
+- `trip_duration` is highly right-skewed, with extreme long-duration outliers.
+- Coordinate values include clear outliers outside NYC.
+- `passenger_count` has possible anomalies, especially zero passengers and rare counts above six.
+- Pickup dates cover the first half of 2016, so any time-based validation should respect this date range.
+- Hour-of-day, weekday, vendor, passenger count, store-and-forward flag, and pickup/dropoff geography all look like plausible predictors to examine next.
