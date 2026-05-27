@@ -20,6 +20,7 @@ This document starts with a first exploratory look at `data/train.csv`. The aim 
 library(tidyverse)
 library(lubridate)
 library(scales)
+library(here)
 
 theme_set(theme_minimal(base_size = 12))
 ```
@@ -27,7 +28,7 @@ theme_set(theme_minimal(base_size = 12))
 ## Read the Training Data
 
 ```{r}
-train_raw <- readr::read_csv("data/train.csv", show_col_types = FALSE)
+train_raw <- readr::read_csv(here::here("data", "train.csv"), show_col_types = FALSE)
 
 train <- train_raw %>%
   mutate(

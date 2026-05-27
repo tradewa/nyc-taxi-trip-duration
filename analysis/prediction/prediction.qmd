@@ -1,0 +1,205 @@
+---
+title: "prediction"
+format: html
+---
+
+## Goal
+
+This document is intended to create prediction for nyc taxi trip duration
+
+## Setup
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(here)
+
+theme_set(theme_minimal(base_size = 12))
+```
+
+## Read the Training Data
+
+```{r}
+train_raw <- readr::read_csv(here::here("data", "train.csv"), show_col_types = FALSE)
+```
+
+## Feature Engineering Notes
+
+The original dataset has pickup/dropoff coordinates and pickup/dropoff time. Those raw fields are useful, but prediction models usually work better when we convert them into features that represent the actual trip pattern more directly.
+
+The new features below are created before modeling:
+
+- `straightline_distance_km`: the shortest geographic distance between pickup and dropoff, measured on the surface of the Earth.
+- `road_proxy_distance_km`: an approximation of road travel distance that moves north/south and east/west instead of going directly point-to-point.
+- `pickup_cluster`: the pickup area group.
+- `dropoff_cluster`: the dropoff area group.
+- `pickup_dropoff_cluster`: the pickup-area to dropoff-area pair.
+- `pickup_cluster_trips` and `dropoff_cluster_trips`: how many training trips are associated with each pickup/dropoff area.
+- `pickup_cluster_share` and `dropoff_cluster_share`: the same area activity counts as a share of all trips.
+
+For every new feature-engineering approach added later, this document should also explain why the feature is useful and how it is created.
+
+## Distance Features
+
+`straightline_distance_km` uses the haversine formula. Longitude and latitude are angles on a sphere, so normal Euclidean distance is not correct for geographic coordinates. The haversine formula converts longitude/latitude from degrees to radians, computes the angular distance between two points, and multiplies by the Earth's radius to get kilometers.
+
+This feature is useful because longer trips usually take more time. However, it is only a lower bound: taxis cannot drive through buildings or directly across water.
+
+`road_proxy_distance_km` is a simple road-distance approximation. It calculates one north/south distance and one east/west distance, then adds them together. This is sometimes called a grid or Manhattan-style distance. It is not the true route from a routing engine, but it is usually more realistic than straight-line distance for city trips because many roads follow a street grid.
+
+```{r}
+earth_radius_km <- 6371.0088
+
+haversine_km <- function(lon1, lat1, lon2, lat2) {
+  lon1 <- lon1 * pi / 180
+  lat1 <- lat1 * pi / 180
+  lon2 <- lon2 * pi / 180
+  lat2 <- lat2 * pi / 180
+
+  delta_lon <- lon2 - lon1
+  delta_lat <- lat2 - lat1
+
+  a <- sin(delta_lat / 2)^2 +
+    cos(lat1) * cos(lat2) * sin(delta_lon / 2)^2
+
+  2 * earth_radius_km * asin(pmin(1, sqrt(a)))
+}
+
+road_proxy_km <- function(pickup_lon, pickup_lat, dropoff_lon, dropoff_lat) {
+  north_south_km <- haversine_km(
+    pickup_lon,
+    pickup_lat,
+    pickup_lon,
+    dropoff_lat
+  )
+  east_west_km <- haversine_km(
+    pickup_lon,
+    dropoff_lat,
+    dropoff_lon,
+    dropoff_lat
+  )
+
+  north_south_km + east_west_km
+}
+```
+
+## Location Cluster Features
+
+Pickup and dropoff coordinates are continuous numeric values. A model can use longitude and latitude directly, but it may not easily learn that nearby points belong to the same meaningful area, such as Midtown, an airport area, or a dense business district.
+
+The clustering approach groups nearby coordinates into area IDs. These area IDs can help the model learn that some parts of the city behave differently from others. For example, two trips with similar distance can take different amounts of time if one starts in a congested area and the other starts in a quieter area.
+
+The code below creates the clusters in several steps:
+
+1. `location_points` combines all pickup and dropoff coordinates into one table with only `lon` and `lat`.
+2. The `filter()` step keeps only points inside a broad NYC bounding box. This prevents extreme coordinate outliers from pulling the cluster centers far away from the normal taxi area.
+3. `set.seed(123)` makes the random sample and the k-means result reproducible.
+4. `location_sample` takes up to 100,000 coordinate points. This keeps clustering fast while still using many examples of taxi locations.
+5. `kmeans(location_sample, centers = 25, nstart = 20)` finds 25 location centers. Each center represents one learned geographic area.
+6. `location_cluster_centers` stores only the final center coordinates so they can be used to assign every trip to its nearest area.
+
+The helper function `assign_nearest_cluster()` is used after the cluster centers are created. It receives a vector of longitudes, a vector of latitudes, and the table of cluster centers. It then returns the ID number of the closest cluster center for each coordinate.
+
+Inside `assign_nearest_cluster()`:
+
+- `coords <- cbind(lon = lon, lat = lat)` combines the longitude and latitude vectors into a two-column matrix. Each row is one trip location.
+- `center_coords <- as.matrix(centers[, c("lon", "lat")])` converts the cluster center table into the same two-column coordinate format.
+- `center_ids <- seq_len(nrow(centers))` creates the cluster labels: `1`, `2`, `3`, and so on.
+- `class::knn1()` assigns each trip location to the single nearest cluster center. This is a nearest-neighbor lookup: the cluster center coordinates are the known examples, and the pickup/dropoff coordinates are the new points we want to label.
+
+This calculation uses longitude/latitude distance only to decide which cluster center is nearest. That is acceptable here because the goal is not to measure trip distance in kilometers; the goal is only to assign each point to the closest learned area.
+
+```{r}
+assign_nearest_cluster <- function(lon, lat, centers) {
+  coords <- cbind(lon = lon, lat = lat)
+  center_coords <- as.matrix(centers[, c("lon", "lat")])
+  center_ids <- seq_len(nrow(centers))
+
+  as.integer(class::knn1(
+    train = center_coords,
+    test = coords,
+    cl = center_ids
+  ))
+}
+
+location_points <- bind_rows(
+  train_raw %>%
+    transmute(lon = pickup_longitude, lat = pickup_latitude),
+  train_raw %>%
+    transmute(lon = dropoff_longitude, lat = dropoff_latitude)
+) %>%
+  filter(
+    between(lon, -74.1, -73.7),
+    between(lat, 40.55, 40.95)
+  )
+
+set.seed(123)
+location_sample <- location_points %>%
+  slice_sample(n = min(100000, nrow(location_points)))
+
+location_clusters <- kmeans(
+  location_sample,
+  centers = 25,
+  nstart = 20
+)
+
+location_cluster_centers <- as_tibble(location_clusters$centers)
+```
+
+## Build Training Features
+
+The next step adds the engineered features to the training dataframe. This keeps the original raw data in `train_raw` and creates a modeling-ready dataframe named `train`.
+
+```{r}
+train <- train_raw %>%
+  mutate(
+    pickup_date = as_date(pickup_datetime),
+    pickup_month = floor_date(pickup_datetime, "month"),
+    pickup_wday = wday(pickup_datetime, label = TRUE, week_start = 1),
+    pickup_hour = hour(pickup_datetime),
+    straightline_distance_km = haversine_km(
+      pickup_longitude,
+      pickup_latitude,
+      dropoff_longitude,
+      dropoff_latitude
+    ),
+    road_proxy_distance_km = road_proxy_km(
+      pickup_longitude,
+      pickup_latitude,
+      dropoff_longitude,
+      dropoff_latitude
+    ),
+    pickup_cluster = factor(assign_nearest_cluster(
+      pickup_longitude,
+      pickup_latitude,
+      location_cluster_centers
+    )),
+    dropoff_cluster = factor(assign_nearest_cluster(
+      dropoff_longitude,
+      dropoff_latitude,
+      location_cluster_centers
+    )),
+    pickup_dropoff_cluster = interaction(
+      pickup_cluster,
+      dropoff_cluster,
+      drop = TRUE
+    ),
+    store_and_fwd_flag = factor(store_and_fwd_flag),
+    vendor_id = factor(vendor_id)
+  ) %>%
+  add_count(pickup_cluster, name = "pickup_cluster_trips") %>%
+  add_count(dropoff_cluster, name = "dropoff_cluster_trips") %>%
+  mutate(
+    pickup_cluster_share = pickup_cluster_trips / n(),
+    dropoff_cluster_share = dropoff_cluster_trips / n()
+  )
+```
+
+```{r}
+glimpse(train_raw)
+```
+
+```{r}
+glimpse(train)
+```
