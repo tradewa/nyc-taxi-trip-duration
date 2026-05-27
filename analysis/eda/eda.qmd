@@ -22,7 +22,7 @@ library(lubridate)
 library(scales)
 library(here)
 
-theme_set(theme_minimal(base_size = 12))
+source(here::here("analysis", "tufte-ggplot.R"))
 ```
 
 ## Read the Training Data
@@ -98,12 +98,12 @@ train %>%
 train %>%
   count(vendor_id, sort = TRUE) %>%
   mutate(pct = n / sum(n)) %>%
-  ggplot(aes(x = vendor_id, y = n, fill = vendor_id)) +
-  geom_col(show.legend = FALSE) +
+  ggplot(aes(x = vendor_id, y = n)) +
+  geom_col(fill = tufte_muted, width = 0.55) +
   geom_text(aes(label = percent(pct, accuracy = 0.1)), vjust = -0.4) +
   scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.08))) +
   labs(
-    title = "Trips by vendor",
+    title = "Vendor 2 accounts for a larger share of trips",
     x = "Vendor ID",
     y = "Trips"
   )
@@ -129,12 +129,14 @@ train %>%
 ```{r}
 train %>%
   count(passenger_count) %>%
+  mutate(passenger_group = if_else(passenger_count %in% c(0, 7, 8, 9), "Unusual", "Typical")) %>%
   ggplot(aes(x = passenger_count, y = n)) +
-  geom_col(fill = "#2f6f6d") +
+  geom_col(aes(fill = passenger_group), width = 0.65) +
+  scale_fill_manual(values = c("Typical" = tufte_muted, "Unusual" = tufte_highlight)) +
   scale_y_continuous(labels = comma) +
   scale_x_continuous(breaks = 0:9) +
   labs(
-    title = "Passenger count distribution",
+    title = "Most taxi trips carry one passenger",
     x = "Passenger count",
     y = "Trips"
   )
@@ -164,7 +166,7 @@ The target is strongly right-skewed. The median trip is about 11 minutes, while 
 ```{r}
 train %>%
   ggplot(aes(x = trip_duration)) +
-  geom_histogram(bins = 80, fill = "#3f7cac", color = "white", linewidth = 0.1) +
+  geom_histogram(bins = 80, fill = tufte_muted, color = tufte_bg, linewidth = 0.1) +
   scale_x_log10(labels = comma) +
   scale_y_continuous(labels = comma) +
   labs(
@@ -179,10 +181,10 @@ train %>%
 train %>%
   filter(trip_duration <= quantile(trip_duration, 0.99)) %>%
   ggplot(aes(x = duration_min)) +
-  geom_histogram(binwidth = 2, fill = "#52796f", color = "white", linewidth = 0.1) +
+  geom_histogram(binwidth = 2, fill = tufte_muted, color = tufte_bg, linewidth = 0.1) +
   scale_y_continuous(labels = comma) +
   labs(
-    title = "Trip duration below the 99th percentile",
+    title = "Most trips under the 99th percentile are short",
     x = "Trip duration in minutes",
     y = "Trips"
   )
@@ -194,10 +196,16 @@ train %>%
 train %>%
   count(pickup_date) %>%
   ggplot(aes(x = pickup_date, y = n)) +
-  geom_line(color = "#2f6f6d", linewidth = 0.5) +
+  geom_hline(
+    yintercept = mean(count(train, pickup_date)$n),
+    color = tufte_axis,
+    linewidth = 0.3
+  ) +
+  geom_line(color = tufte_muted, linewidth = 0.6) +
   scale_y_continuous(labels = comma) +
   labs(
-    title = "Daily pickup volume",
+    title = "Daily pickup volume stays broadly stable",
+    subtitle = "The horizontal reference line shows the daily average.",
     x = "Pickup date",
     y = "Trips"
   )
@@ -207,11 +215,11 @@ train %>%
 train %>%
   count(pickup_hour) %>%
   ggplot(aes(x = pickup_hour, y = n)) +
-  geom_col(fill = "#3f7cac") +
+  geom_col(fill = tufte_muted, width = 0.65) +
   scale_x_continuous(breaks = 0:23) +
   scale_y_continuous(labels = comma) +
   labs(
-    title = "Pickup volume by hour of day",
+    title = "Pickup volume is lowest before dawn",
     x = "Pickup hour",
     y = "Trips"
   )
@@ -221,10 +229,10 @@ train %>%
 train %>%
   count(pickup_wday) %>%
   ggplot(aes(x = pickup_wday, y = n)) +
-  geom_col(fill = "#b56576") +
+  geom_col(fill = tufte_muted, width = 0.65) +
   scale_y_continuous(labels = comma) +
   labs(
-    title = "Pickup volume by weekday",
+    title = "Pickup volume rises toward the end of the week",
     x = "Pickup weekday",
     y = "Trips"
   )
@@ -273,10 +281,10 @@ train_geo_sample <- train %>%
 ```{r}
 train_geo_sample %>%
   ggplot(aes(x = pickup_longitude, y = pickup_latitude)) +
-  geom_point(alpha = 0.08, size = 0.4, color = "#2f6f6d") +
+  geom_point(alpha = 0.08, size = 0.4, color = tufte_muted) +
   coord_quickmap() +
   labs(
-    title = "Sampled pickup locations within the NYC bounding box",
+    title = "Pickup locations cluster along the NYC street network",
     x = "Pickup longitude",
     y = "Pickup latitude"
   )
@@ -285,10 +293,10 @@ train_geo_sample %>%
 ```{r}
 train_geo_sample %>%
   ggplot(aes(x = dropoff_longitude, y = dropoff_latitude)) +
-  geom_point(alpha = 0.08, size = 0.4, color = "#b56576") +
+  geom_point(alpha = 0.08, size = 0.4, color = tufte_muted) +
   coord_quickmap() +
   labs(
-    title = "Sampled dropoff locations within the NYC bounding box",
+    title = "Dropoff locations follow the same dense NYC corridors",
     x = "Dropoff longitude",
     y = "Dropoff latitude"
   )

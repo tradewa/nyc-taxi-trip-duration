@@ -143,3 +143,44 @@ The blog can honestly say:
 
 > I used LightGBM for prediction because it performs well on tabular data, then used a Bayesian explanatory model to understand the major patterns with uncertainty.
 
+## Progress So Far
+
+Completed prediction notebook updates:
+
+- Built core trip-duration feature engineering in `analysis/prediction/prediction.qmd`.
+- Added pickup date, month, weekday, and hour features.
+- Added straight-line haversine distance and Manhattan-style road proxy distance.
+- Added pickup and dropoff location clusters from sampled pickup/dropoff coordinates.
+- Updated the k-means clustering call to use `algorithm = "Lloyd"` and `iter.max = 100`, which avoids the previous Quick-TRANSfer / convergence warnings from the default Hartigan-Wong algorithm.
+- Added cluster activity features:
+  - `pickup_cluster_trips`
+  - `dropoff_cluster_trips`
+  - `pickup_cluster_share`
+  - `dropoff_cluster_share`
+
+Completed validation structure:
+
+- Split the modeling workflow into three clearer sections:
+  - Cross-validation framework
+  - Linear regression baseline
+  - Standard LightGBM model
+- Created reusable cross-validation helpers:
+  - `prepare_cv_data()`
+  - `add_cluster_activity()`
+  - `rmsle()`
+  - `score_cv_fold()`
+- Kept leakage control inside cross-validation by recalculating cluster activity from each fold's training data only, then joining those values onto validation rows.
+- Applied the shared CV framework to the linear regression baseline.
+- Applied the same shared CV framework to the standard LightGBM model.
+- Added model comparison tables and plots for fold-level RMSLE, average RMSLE, RMSE, and LightGBM improvement over the linear baseline.
+
+Verification:
+
+- `quarto render analysis/prediction/prediction.qmd` completed successfully.
+- The render still reports that the `renv` project is out of sync. That is an environment/package-lock status warning, not a notebook execution error.
+
+Current next steps:
+
+- Review the rendered prediction HTML and decide whether the validation sample size should stay at 100,000 rows or increase.
+- If LightGBM validation looks credible, train a final model on all training rows and generate predictions for `test.csv`.
+- Later, add the separate explanatory model for the blog post.

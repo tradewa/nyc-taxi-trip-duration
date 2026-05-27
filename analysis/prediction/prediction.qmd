@@ -15,7 +15,7 @@ library(lubridate)
 library(scales)
 library(here)
 
-theme_set(theme_minimal(base_size = 12))
+source(here::here("analysis", "tufte-ggplot.R"))
 ```
 
 ## Read the Training Data
@@ -96,7 +96,7 @@ The code below creates the clusters in several steps:
 2. The `filter()` step keeps only points inside a broad NYC bounding box. This prevents extreme coordinate outliers from pulling the cluster centers far away from the normal taxi area.
 3. `set.seed(123)` makes the random sample and the k-means result reproducible.
 4. `location_sample` takes up to 100,000 coordinate points. This keeps clustering fast while still using many examples of taxi locations.
-5. `kmeans(location_sample, centers = 25, nstart = 20)` finds 25 location centers. Each center represents one learned geographic area.
+5. `kmeans(location_sample, centers = 25, nstart = 20, iter.max = 1000, algorithm = "MacQueen")` finds 25 location centers. Each center represents one learned geographic area. The MacQueen algorithm avoids the Quick-TRANSfer warnings from the default Hartigan-Wong algorithm, and the higher iteration limit gives the coordinate clusters more room to settle.
 6. `location_cluster_centers` stores only the final center coordinates so they can be used to assign every trip to its nearest area.
 
 The helper function `assign_nearest_cluster()` is used after the cluster centers are created. It receives a vector of longitudes, a vector of latitudes, and the table of cluster centers. It then returns the ID number of the closest cluster center for each coordinate.
@@ -139,9 +139,11 @@ location_sample <- location_points %>%
   slice_sample(n = min(100000, nrow(location_points)))
 
 location_clusters <- kmeans(
-  location_sample,
+  as.matrix(location_sample),
   centers = 25,
-  nstart = 20
+  nstart = 20,
+  iter.max = 1000,
+  algorithm = "MacQueen"
 )
 
 location_cluster_centers <- as_tibble(location_clusters$centers)
@@ -203,3 +205,624 @@ glimpse(train_raw)
 ```{r}
 glimpse(train)
 ```
+
+## Cross-Validation Framework
+
+Before applying a model to `test.csv`, we should estimate how well it performs on data where `trip_duration` is known. This is the role of cross-validation.
+
+Leave-one-out cross-validation is not a good default here. It would train one model for almost every row in `train.csv`, which is too expensive for this dataset. A more practical choice is 5-fold cross-validation:
+
+1. Split the data into 5 parts.
+2. Train the model on 4 parts.
+3. Validate the model on the remaining part.
+4. Repeat until every part has been used once as validation data.
+5. Average the validation errors.
+
+The important leakage rule is that any feature learned from the data, such as cluster activity share, must be learned only from the training fold. The validation fold should receive those values by lookup, just like future `test.csv` rows would.
+
+For the validation pass, this document uses a sample of the training data to keep rendering fast. Later, once the modeling code is stable, we can increase `cv_sample_size` or use the full training data.
+
+The code below defines the reusable cross-validation framework. It does not fit a specific model yet. Each modeling section will provide its own fold prediction function and pass it into `score_cv_fold()`.
+
+`add_cluster_activity(data, reference_data)` adds pickup/dropoff area activity features to a dataframe. The important detail is that it calculates the activity values from `reference_data`, then joins those values onto `data`.
+
+This lets us use the same function in two different situations:
+
+- For the training fold, `data` and `reference_data` are both the training fold. The function calculates how common each pickup and dropoff cluster is inside the training fold and attaches those values back to the training rows.
+- For the validation fold, `data` is the validation fold but `reference_data` is still the training fold. This prevents leakage because the validation rows receive only cluster activity information that would have been known from the training data.
+
+Inside `add_cluster_activity()`:
+
+- `pickup_activity` counts trips by `pickup_cluster` and converts the count into `pickup_cluster_share`, the fraction of all reference trips that start in that cluster.
+- `dropoff_activity` does the same calculation for `dropoff_cluster`.
+- The `select(-any_of(...))` step removes older versions of these activity columns if they already exist. This prevents duplicate column names after the joins.
+- The two `left_join()` calls attach the pickup and dropoff activity summaries to each row.
+- The final `mutate()` replaces missing counts and shares with zero. This handles clusters that appear in `data` but not in `reference_data`.
+
+`rmsle(actual, predicted)` computes root mean squared logarithmic error. It compares `log1p(predicted)` with `log1p(actual)`, where `log1p(x)` means `log(1 + x)`. This metric is useful for trip duration because it cares more about relative error than raw seconds. For example, being off by 5 minutes on a 10-minute trip is treated as more serious than being off by 5 minutes on a 2-hour trip.
+
+`prepare_cv_data(data, sample_size, folds)` creates the validation sample and assigns each row to a fold. It also makes the categorical predictors explicit as factors.
+
+`score_cv_fold(fold_id, data, fit_predict)` runs one cross-validation fold from start to finish:
+
+1. It uses every row except the selected fold as `fold_train`.
+2. It uses the selected fold as `fold_validation`.
+3. It rebuilds the cluster activity features with the leakage rule described above.
+4. It calls the model-specific `fit_predict()` function.
+5. It returns one row containing the fold number, RMSE in seconds, and RMSLE.
+
+If a model-specific function returns extra values such as `best_iteration`, those values are attached to the fold result.
+
+```{r}
+add_cluster_activity <- function(data, reference_data) {
+  pickup_activity <- reference_data %>%
+    count(pickup_cluster, name = "pickup_cluster_trips") %>%
+    mutate(pickup_cluster_share = pickup_cluster_trips / nrow(reference_data))
+
+  dropoff_activity <- reference_data %>%
+    count(dropoff_cluster, name = "dropoff_cluster_trips") %>%
+    mutate(dropoff_cluster_share = dropoff_cluster_trips / nrow(reference_data))
+
+  data %>%
+    select(
+      -any_of(c(
+        "pickup_cluster_trips",
+        "dropoff_cluster_trips",
+        "pickup_cluster_share",
+        "dropoff_cluster_share"
+      ))
+    ) %>%
+    left_join(pickup_activity, by = "pickup_cluster") %>%
+    left_join(dropoff_activity, by = "dropoff_cluster") %>%
+    mutate(
+      pickup_cluster_trips = replace_na(pickup_cluster_trips, 0L),
+      dropoff_cluster_trips = replace_na(dropoff_cluster_trips, 0L),
+      pickup_cluster_share = replace_na(pickup_cluster_share, 0),
+      dropoff_cluster_share = replace_na(dropoff_cluster_share, 0)
+    )
+}
+
+rmsle <- function(actual, predicted) {
+  sqrt(mean((log1p(predicted) - log1p(actual))^2))
+}
+
+prepare_cv_data <- function(data, sample_size = min(100000, nrow(data)), folds = 5) {
+  data %>%
+    slice_sample(n = sample_size) %>%
+    mutate(
+      fold = sample(rep(seq_len(folds), length.out = n())),
+      pickup_wday = factor(pickup_wday),
+      vendor_id = factor(vendor_id),
+      store_and_fwd_flag = factor(store_and_fwd_flag),
+      pickup_cluster = factor(pickup_cluster),
+      dropoff_cluster = factor(dropoff_cluster),
+      pickup_dropoff_cluster = factor(pickup_dropoff_cluster)
+    )
+}
+
+score_cv_fold <- function(fold_id, data, fit_predict) {
+  fold_train <- data %>%
+    filter(fold != fold_id)
+
+  fold_validation <- data %>%
+    filter(fold == fold_id)
+
+  fold_train <- add_cluster_activity(fold_train, fold_train)
+  fold_validation <- add_cluster_activity(fold_validation, fold_train)
+
+  fold_result <- fit_predict(fold_train, fold_validation)
+
+  if (is.list(fold_result) && !is.null(fold_result$predictions)) {
+    predictions <- fold_result$predictions
+    extra_metrics <- fold_result[names(fold_result) != "predictions"] %>%
+      as_tibble()
+  } else {
+    predictions <- fold_result
+    extra_metrics <- tibble()
+  }
+
+  fold_metrics <- tibble(
+    fold = fold_id,
+    rmse_seconds = sqrt(mean((predictions - fold_validation$trip_duration)^2)),
+    rmsle = rmsle(fold_validation$trip_duration, predictions)
+  )
+
+  if (ncol(extra_metrics) == 0) {
+    fold_metrics
+  } else {
+    bind_cols(fold_metrics, extra_metrics)
+  }
+}
+
+set.seed(123)
+cv_sample_size <- min(100000, nrow(train))
+cv_folds <- 5
+cv_data <- prepare_cv_data(train, sample_size = cv_sample_size, folds = cv_folds)
+```
+
+The setup after the functions controls the validation experiment:
+
+- `set.seed(123)` makes the random sample and fold assignment reproducible.
+- `cv_sample_size <- min(100000, nrow(train))` uses up to 100,000 rows, or all rows if the training data is smaller.
+- `cv_folds <- 5` sets the number of folds.
+- `prepare_cv_data()` draws the validation sample, assigns folds, and prepares categorical variables.
+
+## Linear Regression Baseline
+
+The first model is intentionally simple. It gives us a baseline score and tests the validation structure before moving to a stronger model.
+
+The linear model formula includes passenger count, pickup time, vendor/store flags, distance features, pickup/dropoff clusters, and cluster activity shares. The cluster IDs let the model learn location-specific patterns, while the activity shares give it a simple measure of how common each area is in the training data.
+
+The response is `log1p(trip_duration)`, so the model predicts duration on the log scale. The fold prediction function converts predictions back to seconds with `expm1()` and uses `pmax(0)` to keep predictions from going below zero, because negative trip duration is impossible.
+
+```{r}
+linear_model_formula <- log1p(trip_duration) ~
+  passenger_count +
+  pickup_hour +
+  pickup_wday +
+  vendor_id +
+  store_and_fwd_flag +
+  straightline_distance_km +
+  road_proxy_distance_km +
+  pickup_cluster +
+  dropoff_cluster +
+  pickup_cluster_share +
+  dropoff_cluster_share
+
+predict_linear_fold <- function(fold_train, fold_validation) {
+  duration_model <- lm(linear_model_formula, data = fold_train)
+
+  predict(duration_model, newdata = fold_validation) %>%
+    expm1() %>%
+    pmax(0)
+}
+
+linear_cv_results <- map_dfr(
+  seq_len(cv_folds),
+  score_cv_fold,
+  data = cv_data,
+  fit_predict = predict_linear_fold
+)
+
+linear_cv_results
+```
+
+```{r}
+linear_cv_results %>%
+  summarise(
+    mean_rmse_seconds = mean(rmse_seconds),
+    sd_rmse_seconds = sd(rmse_seconds),
+    mean_rmsle = mean(rmsle),
+    sd_rmsle = sd(rmsle)
+  )
+```
+
+The RMSE values can be much less stable than RMSLE because RMSE is measured directly in seconds and heavily penalizes a few very large errors. If a fold contains one extreme trip duration or one extreme prediction, RMSE can become enormous even when most predictions are reasonable. RMSLE is usually more stable for this competition-style duration task because it evaluates error on the log-duration scale.
+
+## Standard LightGBM Model
+
+The linear model above is a useful baseline, but it has a major limitation: it mostly learns one average effect for each feature. For example, it can learn that longer distance usually means longer duration, but it does not naturally learn many nonlinear rules such as:
+
+- a 5 km airport trip behaves differently from a 5 km Midtown trip;
+- rush-hour pickup time matters more in some clusters than others;
+- distance has a different effect for short, medium, and long trips;
+- pickup and dropoff areas interact with time of day.
+
+LightGBM is a gradient boosted tree model. It is usually much stronger than a simple linear model for tabular prediction problems like this one.
+
+The main idea is:
+
+1. LightGBM starts with a simple prediction for every trip.
+2. It measures the errors from that prediction.
+3. It grows a decision tree that tries to explain the remaining errors.
+4. It adds that tree to the model.
+5. It repeats this process many times, where each new tree focuses on what the previous trees still got wrong.
+
+This is called boosting. The final prediction is the combined output of many small trees. Each individual tree is not expected to solve the whole problem. The strength comes from adding many trees in sequence.
+
+For this duration problem, we still model `log1p(trip_duration)` rather than raw `trip_duration`. That keeps the LightGBM objective aligned with RMSLE. After prediction, we convert back to seconds with `expm1()`, the same as the linear baseline.
+
+Some important LightGBM settings used below:
+
+- `objective = "regression"` tells LightGBM this is a numeric prediction problem.
+- `metric = "rmse"` measures error on the log-duration scale during training.
+- `learning_rate` controls how much each new tree changes the model. Smaller values are slower but often more stable.
+- `num_leaves` controls how complex each tree can become. Larger values can learn more detail, but can also overfit.
+- `min_data_in_leaf` prevents leaves from being created from too few rows. This is a practical overfitting control.
+- `feature_fraction` randomly samples columns for each tree. This can reduce overfitting.
+- `bagging_fraction` and `bagging_freq` randomly sample rows while training. This is another regularization tool.
+- `num_iterations` is the maximum number of boosting rounds.
+- `early_stopping_rounds` stops training when validation performance stops improving.
+
+LightGBM requires the predictors to be a numeric matrix. The helper function `make_lgb_matrix()` creates that matrix from the same engineered features used in the baseline, plus `pickup_dropoff_cluster`. It uses `model.matrix()` to one-hot encode factor variables. One-hot encoding means a categorical feature like weekday is converted into several numeric indicator columns, one column per category.
+
+```{r}
+make_lgb_matrix <- function(data, reference_columns = NULL) {
+  feature_data <- data %>%
+    transmute(
+      passenger_count,
+      pickup_hour,
+      pickup_wday,
+      vendor_id,
+      store_and_fwd_flag,
+      straightline_distance_km,
+      road_proxy_distance_km,
+      pickup_cluster,
+      dropoff_cluster,
+      pickup_dropoff_cluster,
+      pickup_cluster_share,
+      dropoff_cluster_share
+    )
+
+  feature_matrix <- model.matrix(~ . - 1, data = feature_data)
+
+  if (!is.null(reference_columns)) {
+    missing_columns <- setdiff(reference_columns, colnames(feature_matrix))
+
+    if (length(missing_columns) > 0) {
+      missing_matrix <- matrix(
+        0,
+        nrow = nrow(feature_matrix),
+        ncol = length(missing_columns),
+        dimnames = list(NULL, missing_columns)
+      )
+
+      feature_matrix <- cbind(feature_matrix, missing_matrix)
+    }
+
+    extra_columns <- setdiff(colnames(feature_matrix), reference_columns)
+
+    if (length(extra_columns) > 0) {
+      feature_matrix <- feature_matrix[, !colnames(feature_matrix) %in% extra_columns]
+    }
+
+    feature_matrix <- feature_matrix[, reference_columns, drop = FALSE]
+  }
+
+  feature_matrix
+}
+
+lightgbm_params <- list(
+  objective = "regression",
+  metric = "rmse",
+  learning_rate = 0.05,
+  num_leaves = 31,
+  min_data_in_leaf = 100,
+  feature_fraction = 0.9,
+  bagging_fraction = 0.8,
+  bagging_freq = 1,
+  verbosity = -1
+)
+
+predict_lightgbm_fold <- function(fold_train, fold_validation) {
+  train_matrix <- make_lgb_matrix(fold_train)
+  validation_matrix <- make_lgb_matrix(
+    fold_validation,
+    reference_columns = colnames(train_matrix)
+  )
+
+  train_dataset <- lightgbm::lgb.Dataset(
+    data = train_matrix,
+    label = log1p(fold_train$trip_duration)
+  )
+
+  validation_dataset <- lightgbm::lgb.Dataset.create.valid(
+    dataset = train_dataset,
+    data = validation_matrix,
+    label = log1p(fold_validation$trip_duration)
+  )
+
+  duration_model <- lightgbm::lgb.train(
+    params = lightgbm_params,
+    data = train_dataset,
+    valids = list(validation = validation_dataset),
+    nrounds = 1000,
+    early_stopping_rounds = 50,
+    verbose = -1
+  )
+
+  predictions <- predict(duration_model, validation_matrix) %>%
+    expm1() %>%
+    pmax(0)
+
+  list(
+    predictions = predictions,
+    best_iteration = duration_model$best_iter
+  )
+}
+
+lightgbm_cv_results <- map_dfr(
+  seq_len(cv_folds),
+  score_cv_fold,
+  data = cv_data,
+  fit_predict = predict_lightgbm_fold
+)
+
+lightgbm_cv_results
+```
+
+The LightGBM fold prediction function plugs into the same `score_cv_fold()` framework used by the linear regression baseline:
+
+1. Split one fold into training and validation.
+2. Recalculate cluster activity using only the training fold.
+3. Convert the modeling columns into numeric matrices.
+4. Train LightGBM on `log1p(trip_duration)`.
+5. Predict validation rows.
+6. Convert predictions back to seconds.
+7. Calculate RMSE and RMSLE.
+
+This gives us a direct comparison against the linear baseline. If LightGBM has a lower mean RMSLE, it is learning useful nonlinear patterns that the linear model missed.
+
+```{r}
+lightgbm_cv_results %>%
+  summarise(
+    mean_best_iteration = mean(best_iteration),
+    mean_rmse_seconds = mean(rmse_seconds),
+    sd_rmse_seconds = sd(rmse_seconds),
+    mean_rmsle = mean(rmsle),
+    sd_rmsle = sd(rmsle)
+  )
+```
+
+After the validation score looks reasonable, a common next step is to inspect feature importance. This does not prove causality, but it is useful for understanding which predictors the LightGBM model relied on most.
+
+The code below trains one LightGBM model on the cross-validation sample and then summarizes split-level feature importance back to the original feature groups. This grouping is important because categorical variables are one-hot encoded into many columns by `model.matrix()`.
+
+```{r}
+lightgbm_importance_data <- add_cluster_activity(cv_data, cv_data)
+lightgbm_importance_matrix <- make_lgb_matrix(lightgbm_importance_data)
+
+lightgbm_importance_dataset <- lightgbm::lgb.Dataset(
+  data = lightgbm_importance_matrix,
+  label = log1p(lightgbm_importance_data$trip_duration)
+)
+
+lightgbm_importance_rounds <- lightgbm_cv_results %>%
+  summarise(rounds = round(mean(best_iteration, na.rm = TRUE))) %>%
+  pull(rounds) %>%
+  max(1, na.rm = TRUE)
+
+lightgbm_importance_model <- lightgbm::lgb.train(
+  params = lightgbm_params,
+  data = lightgbm_importance_dataset,
+  nrounds = lightgbm_importance_rounds,
+  verbose = -1
+)
+
+lightgbm_feature_importance <- lightgbm::lgb.importance(
+  lightgbm_importance_model,
+  percentage = TRUE
+) %>%
+  as_tibble() %>%
+  mutate(
+    feature_group = case_when(
+      str_starts(Feature, "pickup_dropoff_cluster") ~ "pickup-dropoff pair",
+      str_starts(Feature, "pickup_cluster_share") ~ "pickup cluster activity",
+      str_starts(Feature, "dropoff_cluster_share") ~ "dropoff cluster activity",
+      str_starts(Feature, "pickup_cluster") ~ "pickup cluster",
+      str_starts(Feature, "dropoff_cluster") ~ "dropoff cluster",
+      str_starts(Feature, "straightline_distance_km") ~ "straight-line distance",
+      str_starts(Feature, "road_proxy_distance_km") ~ "road proxy distance",
+      str_starts(Feature, "pickup_hour") ~ "pickup hour",
+      str_starts(Feature, "pickup_wday") ~ "pickup weekday",
+      str_starts(Feature, "passenger_count") ~ "passenger count",
+      str_starts(Feature, "vendor_id") ~ "vendor",
+      str_starts(Feature, "store_and_fwd_flag") ~ "store-and-forward flag",
+      TRUE ~ Feature
+    )
+  ) %>%
+  group_by(feature_group) %>%
+  summarise(
+    gain = sum(Gain),
+    cover = sum(Cover),
+    frequency = sum(Frequency),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(gain))
+
+lightgbm_feature_importance
+```
+
+The chart uses gain importance. Gain measures how much a feature reduced model error when it was used in tree splits. Higher gain means the model relied on that feature more for prediction.
+
+```{r}
+lightgbm_feature_importance %>%
+  slice_max(gain, n = 12) %>%
+  mutate(feature_group = fct_reorder(feature_group, gain)) %>%
+  ggplot(aes(x = gain, y = feature_group)) +
+  geom_col(fill = tufte_muted, width = 0.65) +
+  geom_text(
+    aes(label = percent(gain, accuracy = 0.1)),
+    hjust = -0.12,
+    size = 3.3
+  ) +
+  scale_x_continuous(
+    labels = percent,
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Distance and location features drive the LightGBM predictions",
+    x = "Share of LightGBM gain",
+    y = NULL
+  )
+```
+
+```{r}
+bind_rows(
+  linear_cv_results %>%
+    mutate(model = "Linear regression"),
+  lightgbm_cv_results %>%
+    select(fold, rmse_seconds, rmsle) %>%
+    mutate(model = "LightGBM")
+) %>%
+  group_by(model) %>%
+  summarise(
+    mean_rmse_seconds = mean(rmse_seconds),
+    mean_rmsle = mean(rmsle),
+    .groups = "drop"
+  ) %>%
+  arrange(mean_rmsle)
+```
+
+## Model Error Comparison Visuals
+
+Tables are precise, but plots make it easier to see whether one model is consistently better across folds or whether the improvement is driven by only one fold.
+
+The plots below compare the linear regression baseline and LightGBM using the same cross-validation folds:
+
+- The fold-by-fold RMSLE plot shows whether LightGBM improves most folds, not just the average.
+- The average RMSLE plot summarizes the main validation metric and shows fold-to-fold variation.
+- The RMSE plot uses a log scale because RMSE in seconds can be dominated by a few extreme trips or predictions.
+
+```{r}
+linear_plot_results <- linear_cv_results %>%
+  transmute(
+    model = "Linear regression",
+    fold,
+    rmse_seconds,
+    rmsle
+  )
+
+lightgbm_plot_results <- lightgbm_cv_results %>%
+  transmute(
+    model = "LightGBM",
+    fold,
+    rmse_seconds,
+    rmsle
+  )
+
+model_cv_results <- bind_rows(
+  linear_plot_results,
+  lightgbm_plot_results
+) %>%
+  mutate(model = factor(model, levels = c("Linear regression", "LightGBM"))) %>%
+  arrange(model, fold)
+
+model_cv_results
+```
+
+```{r}
+model_cv_results %>%
+  count(model, name = "folds_in_plot")
+```
+
+The most important plot is the RMSLE comparison. Since the model is trained on `log1p(trip_duration)`, RMSLE is the metric that best matches the modeling target.
+
+```{r}
+last_rmsle_labels <- model_cv_results %>%
+  group_by(model) %>%
+  filter(fold == max(fold)) %>%
+  ungroup()
+
+ggplot(model_cv_results, aes(x = fold, y = rmsle, color = model)) +
+  geom_line(aes(group = model, linetype = model), linewidth = 0.8) +
+  geom_point(aes(shape = model), size = 2.4) +
+  geom_text(
+    data = last_rmsle_labels,
+    aes(label = model),
+    hjust = -0.1,
+    size = 3.4,
+    show.legend = FALSE
+  ) +
+  scale_color_tufte_models() +
+  scale_linetype_manual(values = c("Linear regression" = "dashed", "LightGBM" = "solid")) +
+  scale_shape_manual(values = c("Linear regression" = 1, "LightGBM" = 16)) +
+  scale_x_continuous(breaks = seq_len(cv_folds), expand = expansion(mult = c(0.02, 0.22))) +
+  labs(
+    title = "LightGBM has lower RMSLE across validation folds",
+    x = "Fold",
+    y = "RMSLE"
+  )
+```
+
+This chart answers: "Which model has the lower average RMSLE, and how much does the score vary across folds?" A lower point is better. Shorter error bars mean the model is more consistent across folds.
+
+```{r}
+model_cv_summary <- model_cv_results %>%
+  group_by(model) %>%
+  summarise(
+    mean_rmsle = mean(rmsle),
+    sd_rmsle = sd(rmsle),
+    mean_rmse_seconds = mean(rmse_seconds),
+    sd_rmse_seconds = sd(rmse_seconds),
+    .groups = "drop"
+  )
+
+ggplot(model_cv_summary, aes(x = model, y = mean_rmsle, fill = model)) +
+  geom_col(width = 0.55, show.legend = FALSE) +
+  geom_errorbar(
+    aes(ymin = mean_rmsle - sd_rmsle, ymax = mean_rmsle + sd_rmsle),
+    width = 0.15
+  ) +
+  geom_text(
+    aes(label = number(mean_rmsle, accuracy = 0.001)),
+    vjust = -0.7,
+    size = 3.5
+  ) +
+  scale_fill_tufte_models() +
+  labs(
+    title = "LightGBM has the lower average RMSLE",
+    x = NULL,
+    y = "Mean RMSLE"
+  )
+```
+
+RMSE is still useful because it is measured in seconds, but it can be unstable when a fold has one very large error. The log scale keeps both models visible even when one fold has an unusually large RMSE.
+
+```{r}
+last_rmse_labels <- model_cv_results %>%
+  group_by(model) %>%
+  filter(fold == max(fold)) %>%
+  ungroup()
+
+ggplot(model_cv_results, aes(x = fold, y = rmse_seconds, color = model)) +
+  geom_line(aes(group = model, linetype = model), linewidth = 0.8) +
+  geom_point(aes(shape = model), size = 2.4) +
+  geom_text(
+    data = last_rmse_labels,
+    aes(label = model),
+    hjust = -0.1,
+    size = 3.4,
+    show.legend = FALSE
+  ) +
+  scale_color_tufte_models() +
+  scale_linetype_manual(values = c("Linear regression" = "dashed", "LightGBM" = "solid")) +
+  scale_shape_manual(values = c("Linear regression" = 1, "LightGBM" = 16)) +
+  scale_x_continuous(breaks = seq_len(cv_folds), expand = expansion(mult = c(0.02, 0.22))) +
+  scale_y_log10(labels = label_number()) +
+  labs(
+    title = "RMSE varies sharply across validation folds",
+    subtitle = "Log scale is used because RMSE can be dominated by extreme errors.",
+    x = "Fold",
+    y = "RMSE in seconds, log scale"
+  )
+```
+
+This final view shows the fold-level RMSLE difference directly. A positive value means LightGBM improved over the linear model for that fold. A negative value means LightGBM was worse for that fold.
+
+```{r}
+linear_fold_rmsle <- model_cv_results %>%
+  filter(as.character(model) == "Linear regression") %>%
+  transmute(fold, linear_rmsle = rmsle)
+
+lightgbm_fold_rmsle <- model_cv_results %>%
+  filter(as.character(model) == "LightGBM") %>%
+  transmute(fold, lightgbm_rmsle = rmsle)
+
+rmsle_improvement <- linear_fold_rmsle %>%
+  inner_join(lightgbm_fold_rmsle, by = "fold") %>%
+  mutate(rmsle_improvement = linear_rmsle - lightgbm_rmsle)
+
+ggplot(rmsle_improvement, aes(x = fold, y = rmsle_improvement)) +
+  geom_hline(yintercept = 0, color = tufte_axis, linewidth = 0.3) +
+  geom_col(aes(fill = rmsle_improvement > 0), width = 0.65) +
+  scale_fill_manual(values = c("TRUE" = tufte_highlight, "FALSE" = tufte_secondary)) +
+  scale_x_continuous(breaks = seq_len(cv_folds)) +
+  labs(
+    title = "Positive bars show where LightGBM improves RMSLE",
+    x = "Fold",
+    y = "Linear RMSLE minus LightGBM RMSLE"
+  )
+```
+
+If the LightGBM validation score is better than the baseline, the next step is to train one final LightGBM model on all available training rows and apply the same feature engineering to `test.csv`. That final step should only happen after the validation score looks credible, because `test.csv` does not contain `trip_duration` and cannot tell us whether the model is actually better.
